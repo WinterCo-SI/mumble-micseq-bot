@@ -35,9 +35,9 @@ type fileDropped struct {
 type fileChannel struct {
 	DurationS   int64         `json:"duration_s"`
 	Target      uint32        `json:"target"`
+	CC          []uint32      `json:"cc,omitempty"`
 	Speaker     *fileMember   `json:"speaker,omitempty"`
 	RemainingMS int64         `json:"remaining_ms,omitempty"`
-	Warned      bool          `json:"warned,omitempty"`
 	Queue       []fileMember  `json:"queue"`
 	Exempt      []fileMember  `json:"exempt,omitempty"`
 	Finished    []fileMember  `json:"finished,omitempty"`
@@ -54,7 +54,7 @@ func (m *Manager) MarshalState() ([]byte, error) {
 		fc := &fileChannel{
 			DurationS: int64(cs.marker.Duration / time.Second),
 			Target:    cs.marker.TargetID,
-			Warned:    cs.warned,
+			CC:        cs.marker.CC,
 			Queue:     make([]fileMember, 0, len(cs.queue)),
 			Exempt:    setMembers(cs.exempt),
 			Finished:  setMembers(cs.finished),
@@ -107,7 +107,7 @@ func (m *Manager) RestoreState(data []byte) error {
 		}
 		cs := newChannelState(uint32(id))
 		cs.restored = true
-		cs.marker = Marker{Duration: time.Duration(fc.DurationS) * time.Second, TargetID: fc.Target}
+		cs.marker = Marker{Duration: time.Duration(fc.DurationS) * time.Second, TargetID: fc.Target, CC: fc.CC}
 		for _, q := range fc.Queue {
 			cs.queue = append(cs.queue, member{Key: q.Key, Name: q.Name, Resume: time.Duration(q.ResumeMS) * time.Millisecond})
 		}
@@ -127,7 +127,7 @@ func (m *Manager) RestoreState(data []byte) error {
 		if fc.Speaker != nil && fc.RemainingMS > 0 {
 			cs.speaker = &member{Key: fc.Speaker.Key, Name: fc.Speaker.Name}
 			cs.remaining = time.Duration(fc.RemainingMS) * time.Millisecond
-			cs.warned = fc.Warned
+			cs.reminded = cs.remaining
 		}
 		m.managed[cs.id] = cs
 	}

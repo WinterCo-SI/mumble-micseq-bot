@@ -1,8 +1,12 @@
 package micseq
 
 import (
+	"fmt"
+	"math"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -10,13 +14,15 @@ import (
 // Config tunes the manager. Zero intervals disable the matching announcement.
 type Config struct {
 	// QueueInterval is how often the full status (speaker, remaining time and
-	// queue) is posted.
+	// queue) is posted when nothing changed in between.
 	QueueInterval time.Duration
-	// RemainingInterval is how often the speaker's remaining time is posted.
-	RemainingInterval time.Duration
-	// WarnBefore is how long before the end of a turn the next user is told
-	// to get ready.
-	WarnBefore time.Duration
+	// SpeakerReminders are the remaining times at which the speaker is told
+	// privately how long they have left.
+	SpeakerReminders []time.Duration
+	// NextReminders are the speaker's remaining times at which the next user
+	// is told privately to get ready. Someone who becomes next with less time
+	// left than the largest checkpoint is told right away.
+	NextReminders []time.Duration
 	// ConfirmTimeout is how long to wait for the server to confirm an
 	// unsuppress or a move.
 	ConfirmTimeout time.Duration
@@ -43,12 +49,24 @@ type Config struct {
 	Less func(a, b string) bool
 }
 
+// DefaultSpeakerReminders and DefaultNextReminders get denser towards the
+// end of a turn.
+var (
+	DefaultSpeakerReminders = []time.Duration{
+		time.Hour, 30 * time.Minute, 15 * time.Minute, 10 * time.Minute, 5 * time.Minute,
+		3 * time.Minute, 2 * time.Minute, time.Minute, 30 * time.Second, 10 * time.Second,
+	}
+	DefaultNextReminders = []time.Duration{
+		10 * time.Minute, 5 * time.Minute, 2 * time.Minute, time.Minute, 30 * time.Second, 10 * time.Second,
+	}
+)
+
 // DefaultConfig returns the default timings.
 func DefaultConfig() Config {
 	return Config{
 		QueueInterval:      60 * time.Second,
-		RemainingInterval:  60 * time.Second,
-		WarnBefore:         30 * time.Second,
+		SpeakerReminders:   DefaultSpeakerReminders,
+		NextReminders:      DefaultNextReminders,
 		ConfirmTimeout:     5 * time.Second,
 		ResuppressBackoff:  3 * time.Second,
 		PersistInterval:    5 * time.Second,
@@ -85,6 +103,19 @@ type userEntry struct {
 	// joinSeq orders observed channel entries; 0 means the entry was not
 	// observed (the user was already there when the bot connected).
 	joinSeq uint64
+	// connSeq orders sessions by when they were first seen; 0 means the
+	// session was already connected when the bot connected.
+	connSeq uint64
+}
+
+// newer reports whether a is a more recent session than b. When a user is
+// connected more than once (typically a ghost session the server has not
+// dropped yet after a reconnect), the newest session represents them.
+func newer(a, b *userEntry) bool {
+	if a.connSeq != b.connSeq {
+		return a.connSeq > b.connSeq
+	}
+	return a.Session > b.Session
 }
 
 type pendingMove struct {
@@ -104,20 +135,48 @@ type channelState struct {
 	away     map[string]time.Time // disconnected members: keep place until
 	dropped  map[string]droppedSpeaker
 
-	speaker        *member
-	remaining      time.Duration
-	paused         bool
-	warned         bool
-	confirmed      bool
-	turnStart      time.Time
-	lastResuppress time.Time
+	speaker   *member
+	remaining time.Duration
+	paused    bool
+	confirmed bool
+	turnStart time.Time
+	// unsuppressed records when each of the speaker's sessions was last
+	// unsuppressed, to back off retries against a server that re-suppresses.
+	unsuppressed map[uint32]time.Time
 
-	lastQueueAnnounce  time.Time
-	lastRemainAnnounce time.Time
+	// reminded is the last speaker reminder checkpoint sent; nextKey is who
+	// was last seen as next, and nextReminded their last checkpoint.
+	reminded     time.Duration
+	nextKey      string
+	nextReminded time.Duration
+
+	// announced is the queue signature last broadcast; statusDue forces the
+	// next flush to broadcast the status anyway.
+	announced         string
+	statusDue         bool
+	lastQueueAnnounce time.Time
 
 	permWarned      bool
 	targetWarnedFor uint32 // target ID already warned about; 0 = none
+	ccWarnedFor     string // missing CC IDs already warned about
 	restored        bool
+}
+
+// notReminded is the reminder checkpoint of someone not reminded yet.
+const notReminded = time.Duration(math.MaxInt64)
+
+// outbox collects what a channel is told while handling one event, so it can
+// go out as a single message: the server's message rate limit is tight.
+type outbox struct {
+	notes  []string
+	status bool
+	cc     []uint32
+}
+
+// joinNote is a user added to a queue, to be told their position.
+type joinNote struct {
+	channel uint32
+	key     string
 }
 
 // Manager is the 麦序 state machine. It never talks to the server itself:
@@ -134,12 +193,15 @@ type Manager struct {
 	invalidWarned map[uint32]string
 
 	joinSeq     uint64
+	connSeq     uint64
 	lastTick    time.Time
 	lastPersist time.Time
 	dirty       bool
 	synced      bool
 
-	out []Action
+	out    []Action
+	boxes  map[uint32]*outbox
+	joined []joinNote
 }
 
 // NewManager creates a manager.
@@ -154,19 +216,140 @@ func NewManager(cfg Config) *Manager {
 		managed:       map[uint32]*channelState{},
 		pending:       map[string]*pendingMove{},
 		invalidWarned: map[uint32]string{},
+		boxes:         map[uint32]*outbox{},
 	}
 }
 
 func (m *Manager) emit(a Action) { m.out = append(m.out, a) }
 
+// sayChan adds a note to the channel's next broadcast.
 func (m *Manager) sayChan(id uint32, text string) {
-	m.emit(SayChannel{ChannelID: id, HTML: text})
+	box := m.boxes[id]
+	if box == nil {
+		box = &outbox{}
+		m.boxes[id] = box
+	}
+	box.notes = append(box.notes, text)
+	if cs := m.managed[id]; cs != nil {
+		box.cc = m.ccTargets(cs)
+	}
 }
 
-func (m *Manager) flush() []Action {
+// sayUser sends a private message about a channel.
+func (m *Manager) sayUser(channel, session uint32, text string) {
+	m.emit(SayUser{Session: session, HTML: privateCard(m.channelName(channel), text)})
+}
+
+func statusKey(id uint32) string {
+	return "status:" + strconv.FormatUint(uint64(id), 10)
+}
+
+// flush turns everything collected while handling one event into actions:
+// one broadcast per channel, carrying its notes and, whenever the speaker or
+// the queue changed, the current status.
+func (m *Manager) flush(now time.Time) []Action {
+	for _, id := range sortedIDs(m.managed) {
+		cs := m.managed[id]
+		sig := cs.signature()
+		if sig == cs.announced && !cs.statusDue {
+			continue
+		}
+		cs.announced, cs.statusDue = sig, false
+		cs.lastQueueAnnounce = now
+		if m.boxes[id] == nil {
+			m.boxes[id] = &outbox{}
+		}
+		m.boxes[id].status = true
+	}
+	for _, id := range sortedIDs(m.boxes) {
+		box := m.boxes[id]
+		cs := m.managed[id]
+		c := newCard(m.channelName(id))
+		for _, n := range box.notes {
+			c.line(n)
+		}
+		if cs != nil {
+			box.cc = m.ccTargets(cs)
+			if box.status {
+				m.writeStatus(c, cs)
+			}
+		}
+		say := SayChannel{ChannelID: id, CC: box.cc, HTML: c.String()}
+		switch {
+		case len(box.notes) == 0:
+			say.Coalesce = statusKey(id)
+		case box.status:
+			say.Replaces = statusKey(id)
+		}
+		m.emit(say)
+	}
+	clear(m.boxes)
+	for _, j := range m.joined {
+		m.notifyJoined(j)
+	}
+	m.joined = nil
+
 	out := m.out
 	m.out = nil
 	return out
+}
+
+// signature identifies the speaker and the queue order.
+func (cs *channelState) signature() string {
+	var sb strings.Builder
+	if cs.speaker != nil {
+		sb.WriteString(cs.speaker.Key)
+	}
+	for _, q := range cs.queue {
+		sb.WriteByte(0)
+		sb.WriteString(q.Key)
+	}
+	return sb.String()
+}
+
+func (m *Manager) writeStatus(c *card, cs *channelState) {
+	present := m.presentIn(cs.id)
+	note := noteNone
+	switch {
+	case m.speakerAway(cs):
+		note = noteOffline
+	case cs.paused:
+		note = notePaused
+	}
+	lines := make([]statusLine, len(cs.queue))
+	for i, q := range cs.queue {
+		lines[i] = statusLine{Name: q.Name, Offline: present[q.Key] == nil}
+	}
+	c.status(cs.speaker, cs.remaining, note, lines)
+}
+
+func (m *Manager) notifyJoined(j joinNote) {
+	cs := m.managed[j.channel]
+	if cs == nil {
+		return
+	}
+	u := m.presentIn(cs.id)[j.key]
+	if u == nil {
+		return
+	}
+	for i, q := range cs.queue {
+		if q.Key == j.key {
+			m.sayUser(cs.id, u.Session, msgJoinedPrivate(i+1, q.Resume > 0))
+			return
+		}
+	}
+}
+
+// ccTargets returns the existing channels a managed channel's broadcasts are
+// copied to.
+func (m *Manager) ccTargets(cs *channelState) []uint32 {
+	var ids []uint32
+	for _, id := range cs.marker.CC {
+		if _, ok := m.channels[id]; ok && id != cs.id {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // Sync replaces the manager's view of the server with a fresh snapshot taken
@@ -189,8 +372,7 @@ func (m *Manager) Sync(s Snapshot, now time.Time) []Action {
 
 	for key, p := range m.pending {
 		p.deadline = now.Add(m.cfg.ConfirmTimeout)
-		u := m.userByKey(key)
-		if _, ok := m.managed[p.from]; !ok || u == nil || u.ChannelID != p.from {
+		if _, ok := m.managed[p.from]; !ok || len(m.sessionsIn(p.from, key)) == 0 {
 			delete(m.pending, key)
 		}
 	}
@@ -203,7 +385,7 @@ func (m *Manager) Sync(s Snapshot, now time.Time) []Action {
 		if cs.speaker != nil {
 			cs.confirmed = false
 			cs.turnStart = now
-			cs.lastResuppress = time.Time{}
+			clear(cs.unsuppressed)
 		}
 		// After a reconnect (for example a server restart) users come back
 		// one by one; keep everyone's place for a while.
@@ -225,7 +407,7 @@ func (m *Manager) Sync(s Snapshot, now time.Time) []Action {
 			m.sayChan(id, msgSpeakerOffline(cs.speaker.Name, m.cfg.SpeakerOfflineWait, cs.remaining))
 		}
 	}
-	return m.flush()
+	return m.flush(now)
 }
 
 // markAway starts the offline wait for a speaker or queued member who is
@@ -267,7 +449,7 @@ func (m *Manager) Handle(ev Event, now time.Time) []Action {
 			m.dirty = true
 		}
 	}
-	return m.flush()
+	return m.flush(now)
 }
 
 func (m *Manager) userChanged(e UserChanged, now time.Time) {
@@ -281,13 +463,20 @@ func (m *Manager) userChanged(e UserChanged, now time.Time) {
 	default:
 		entry.joinSeq = old.joinSeq
 	}
+	if old == nil {
+		m.connSeq++
+		entry.connSeq = m.connSeq
+	} else {
+		entry.connSeq = old.connSeq
+	}
 	m.users[u.Session] = entry
 	key := u.Key()
 
-	if old != nil && old.Key() != key {
+	// Another session may still hold the old key; its state stays with it.
+	if old != nil && old.Key() != key && m.userByKey(old.Key()) == nil {
 		m.renameKey(old.Key(), key, u.Name)
 	}
-	if p, ok := m.pending[key]; ok && u.ChannelID != p.from {
+	if p, ok := m.pending[key]; ok && len(m.sessionsIn(p.from, key)) == 0 {
 		delete(m.pending, key)
 	}
 
@@ -316,9 +505,17 @@ func (m *Manager) userGone(session uint32, now time.Time) {
 	}
 	delete(m.users, session)
 	key := old.Key()
-	delete(m.pending, key)
+	if p, ok := m.pending[key]; ok && len(m.sessionsIn(p.from, key)) == 0 {
+		delete(m.pending, key)
+	}
 	cs := m.managed[old.ChannelID]
 	if cs == nil {
+		return
+	}
+	if len(m.sessionsIn(cs.id, key)) > 0 {
+		// Another of the user's sessions is still here, e.g. the server
+		// dropped the ghost of a client that already reconnected.
+		m.reconcile(cs, now)
 		return
 	}
 	// A disconnect may be temporary (a network hiccup or a server restart).
@@ -374,8 +571,8 @@ func (m *Manager) refreshChannel(id uint32, now time.Time) {
 	case !found:
 		delete(m.invalidWarned, id)
 		if cs != nil {
-			delete(m.managed, id)
 			m.sayChan(id, msgStopped())
+			delete(m.managed, id)
 			m.dirty = true
 		}
 		return
@@ -392,12 +589,17 @@ func (m *Manager) refreshChannel(id uint32, now time.Time) {
 	}
 	delete(m.invalidWarned, id)
 
-	if cs == nil {
+	takeover := cs == nil
+	if takeover {
 		cs = newChannelState(id)
 		cs.marker = marker
 		m.managed[id] = cs
-		cs.lastQueueAnnounce = now
-		m.sayChan(id, msgTakeover(marker.Duration, m.channelName(marker.TargetID)))
+		cs.statusDue = true
+		var cc []string
+		for _, c := range m.ccTargets(cs) {
+			cc = append(cc, m.channelName(c))
+		}
+		m.sayChan(id, msgTakeover(marker.Duration, m.channelName(marker.TargetID), cc))
 		if open := m.unsuppressedIn(id); len(open) > 0 {
 			m.sayChan(id, msgACLOpen(open))
 		}
@@ -405,29 +607,48 @@ func (m *Manager) refreshChannel(id uint32, now time.Time) {
 	} else {
 		if cs.restored {
 			cs.restored = false
-			cs.lastQueueAnnounce = now
+			cs.statusDue = true
 			m.sayChan(id, msgResumeAfterRestart())
 		}
-		if cs.marker != marker {
+		if !cs.marker.Equal(marker) {
 			cs.marker = marker
 			m.dirty = true
 		}
 	}
 	m.checkTarget(cs)
 	m.reconcile(cs, now)
+	if takeover {
+		// Everyone already there is listed in the takeover broadcast; a private
+		// note to each would hold up other messages behind the rate limit.
+		m.joined = slices.DeleteFunc(m.joined, func(j joinNote) bool { return j.channel == id })
+	}
 }
 
 func newChannelState(id uint32) *channelState {
 	return &channelState{
-		id:       id,
-		exempt:   map[string]string{},
-		finished: map[string]string{},
-		away:     map[string]time.Time{},
-		dropped:  map[string]droppedSpeaker{},
+		id:           id,
+		exempt:       map[string]string{},
+		finished:     map[string]string{},
+		away:         map[string]time.Time{},
+		dropped:      map[string]droppedSpeaker{},
+		unsuppressed: map[uint32]time.Time{},
 	}
 }
 
 func (m *Manager) checkTarget(cs *channelState) {
+	var missing []uint32
+	for _, id := range cs.marker.CC {
+		if _, ok := m.channels[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	if key := fmt.Sprint(missing); key != cs.ccWarnedFor {
+		cs.ccWarnedFor = key
+		if len(missing) > 0 {
+			m.sayChan(cs.id, msgBadCC(missing))
+		}
+	}
+
 	t := cs.marker.TargetID
 	_, exists := m.channels[t]
 	if exists && t != cs.id {
@@ -438,6 +659,16 @@ func (m *Manager) checkTarget(cs *channelState) {
 		cs.targetWarnedFor = t
 		m.sayChan(cs.id, msgBadTarget(t, t == cs.id))
 	}
+}
+
+// targetName names the channel a finished speaker is moved to, or returns ""
+// when there is no usable one.
+func (m *Manager) targetName(cs *channelState) string {
+	t := cs.marker.TargetID
+	if _, ok := m.channels[t]; !ok || t == cs.id {
+		return ""
+	}
+	return m.channelName(t)
 }
 
 func (m *Manager) channelName(id uint32) string {
@@ -461,24 +692,42 @@ func (m *Manager) unsuppressedIn(id uint32) []string {
 	return names
 }
 
-// presentIn returns the queueable users currently in a channel, by key.
+// presentIn returns the queueable users currently in a channel, by key; a
+// user connected more than once is represented by their newest session.
 func (m *Manager) presentIn(id uint32) map[string]*userEntry {
 	present := map[string]*userEntry{}
 	for _, u := range m.users {
-		if u.ChannelID == id && !u.Ignored {
+		if u.ChannelID != id || u.Ignored {
+			continue
+		}
+		if cur := present[u.Key()]; cur == nil || newer(u, cur) {
 			present[u.Key()] = u
 		}
 	}
 	return present
 }
 
-func (m *Manager) userByKey(key string) *userEntry {
+// sessionsIn returns all of a user's sessions in a channel, newest first.
+func (m *Manager) sessionsIn(id uint32, key string) []*userEntry {
+	var out []*userEntry
 	for _, u := range m.users {
-		if u.Key() == key {
-			return u
+		if u.ChannelID == id && !u.Ignored && u.Key() == key {
+			out = append(out, u)
 		}
 	}
-	return nil
+	sort.Slice(out, func(i, j int) bool { return newer(out[i], out[j]) })
+	return out
+}
+
+// userByKey returns the user's newest session anywhere on the server.
+func (m *Manager) userByKey(key string) *userEntry {
+	var best *userEntry
+	for _, u := range m.users {
+		if u.Key() == key && (best == nil || newer(u, best)) {
+			best = u
+		}
+	}
+	return best
 }
 
 // reconcile brings a managed channel's state in line with who is actually
@@ -510,8 +759,10 @@ func (m *Manager) reconcile(cs *channelState, now time.Time) {
 	for key := range cs.finished {
 		if _, ok := present[key]; !ok {
 			delete(cs.finished, key)
-			if u := m.userByKey(key); u != nil && u.Muted {
-				m.emit(SetMute{Session: u.Session, Muted: false})
+			for _, u := range m.users {
+				if u.Key() == key && u.Muted {
+					m.emit(SetMute{Session: u.Session, Muted: false})
+				}
 			}
 			m.dirty = true
 		}
@@ -525,9 +776,9 @@ func (m *Manager) reconcile(cs *channelState, now time.Time) {
 			delete(cs.away, key)
 			cs.confirmed = false
 			cs.turnStart = now
-			cs.lastResuppress = time.Time{}
-			cs.lastRemainAnnounce = now
+			clear(cs.unsuppressed)
 			cs.remaining += m.cfg.RejoinBonus
+			cs.reminded = cs.remaining
 			m.sayChan(cs.id, msgRejoined(cs.speaker.Name, m.cfg.RejoinBonus, cs.remaining))
 			m.dirty = true
 		case ok, cs.isAway(key, now):
@@ -543,7 +794,7 @@ func (m *Manager) reconcile(cs *channelState, now time.Time) {
 			}
 			cs.speaker = nil
 			m.dirty = true
-			m.startNext(cs, now, true)
+			m.startNext(cs, now)
 		}
 	}
 
@@ -567,6 +818,7 @@ func (m *Manager) reconcile(cs *channelState, now time.Time) {
 			// they go right after the current speaker.
 			delete(cs.dropped, key)
 			cs.insertResumed(member{Key: key, Name: u.Name, Resume: d.Remaining})
+			m.joined = append(m.joined, joinNote{cs.id, key})
 			m.sayChan(cs.id, msgCutIn(u.Name))
 			m.dirty = true
 			continue
@@ -588,27 +840,29 @@ func (m *Manager) reconcile(cs *channelState, now time.Time) {
 	})
 	for _, u := range missing {
 		cs.queue = append(cs.queue, member{Key: u.Key(), Name: u.Name})
+		m.joined = append(m.joined, joinNote{cs.id, u.Key()})
 		m.dirty = true
 	}
 
 	if cs.speaker == nil {
-		m.startNext(cs, now, false)
+		m.startNext(cs, now)
 		return
 	}
 
-	sp := present[cs.speaker.Key]
-	if sp == nil {
+	sessions := m.sessionsIn(cs.id, cs.speaker.Key)
+	if len(sessions) == 0 {
 		return // disconnected, waiting for them to come back
 	}
+	sp := sessions[0]
 	cs.speaker.Name = sp.Name
-	if sp.Suppressed {
-		cs.confirmed = false
-		if cs.lastResuppress.IsZero() || now.Sub(cs.lastResuppress) >= m.cfg.ResuppressBackoff {
-			cs.lastResuppress = now
-			m.emit(Unsuppress{Session: sp.Session})
+	cs.confirmed = true
+	for _, u := range sessions {
+		if u.Suppressed {
+			cs.confirmed = false
 		}
-	} else {
-		cs.confirmed = true
+	}
+	if !cs.confirmed {
+		m.unsuppressAll(cs, sessions, now)
 	}
 	if paused := sp.Muted || sp.Deafened; paused != cs.paused {
 		cs.paused = paused
@@ -714,14 +968,9 @@ func (cs *channelState) removeQueued(key string) bool {
 
 // startNext gives the floor to the first queued user who is present;
 // disconnected users keep their place until they return or time out.
-// announceEmpty controls whether an empty queue is reported (only right
-// after a turn ends).
-func (m *Manager) startNext(cs *channelState, now time.Time, announceEmpty bool) {
+func (m *Manager) startNext(cs *channelState, now time.Time) {
 	head := m.nextPresent(cs)
 	if head == nil {
-		if announceEmpty && len(cs.queue) == 0 {
-			m.sayChan(cs.id, msgQueueEmpty())
-		}
 		return
 	}
 	u := m.presentIn(cs.id)[head.Key]
@@ -733,52 +982,79 @@ func (m *Manager) startNext(cs *channelState, now time.Time, announceEmpty bool)
 	if resume > 0 {
 		cs.remaining = resume + m.cfg.RejoinBonus
 	}
-	cs.warned = false
+	cs.reminded = cs.remaining
+	cs.nextKey = ""
 	cs.turnStart = now
-	cs.lastRemainAnnounce = now
-	cs.confirmed = !u.Suppressed
+	cs.confirmed = true
 	cs.paused = u.Muted || u.Deafened
-	cs.lastResuppress = time.Time{}
-	if u.Suppressed {
-		cs.lastResuppress = now
-		m.emit(Unsuppress{Session: u.Session})
+	clear(cs.unsuppressed)
+	if m.unsuppressAll(cs, m.sessionsIn(cs.id, u.Key()), now) {
+		cs.confirmed = false
 	}
-	m.sayChan(cs.id, msgTurnStart(u.Name, cs.remaining, resume > 0, m.nextPresent(cs)))
+	m.sayChan(cs.id, msgTurnStart(u.Name, cs.remaining, resume > 0))
+	m.sayUser(cs.id, u.Session, msgYourTurnPrivate(cs.remaining, m.targetName(cs), resume > 0))
 	if cs.paused {
 		m.sayChan(cs.id, msgPaused(u.Name, cs.remaining))
 	}
 	m.dirty = true
 }
 
-// endTurn moves the current speaker out once their time is up.
+// unsuppressAll lets every suppressed session of the speaker talk, so a user
+// connected twice is not left half-silenced. A session is retried at most
+// once per ResuppressBackoff. It reports whether any session is suppressed.
+func (m *Manager) unsuppressAll(cs *channelState, sessions []*userEntry, now time.Time) bool {
+	found := false
+	for _, u := range sessions {
+		if !u.Suppressed {
+			continue
+		}
+		found = true
+		if last, ok := cs.unsuppressed[u.Session]; ok && now.Sub(last) < m.cfg.ResuppressBackoff {
+			continue
+		}
+		cs.unsuppressed[u.Session] = now
+		m.emit(Unsuppress{Session: u.Session})
+	}
+	return found
+}
+
+// endTurn moves the current speaker out once their time is up, with all of
+// their sessions: one left behind would keep the floor.
 func (m *Manager) endTurn(cs *channelState, now time.Time) {
 	sp := *cs.speaker
 	cs.speaker = nil
 	m.dirty = true
-	u := m.presentIn(cs.id)[sp.Key]
-	target := cs.marker.TargetID
-	_, targetExists := m.channels[target]
-	switch {
-	case u == nil:
-	case targetExists && target != cs.id:
-		m.emit(Move{Session: u.Session, ChannelID: target})
+	sessions := m.sessionsIn(cs.id, sp.Key)
+	switch target := m.targetName(cs); {
+	case len(sessions) == 0:
+	case target != "":
+		for _, u := range sessions {
+			m.emit(Move{Session: u.Session, ChannelID: cs.marker.TargetID})
+		}
 		m.pending[sp.Key] = &pendingMove{
-			name:     u.Name,
+			name:     sessions[0].Name,
 			from:     cs.id,
-			target:   target,
+			target:   cs.marker.TargetID,
 			deadline: now.Add(m.cfg.ConfirmTimeout),
 		}
-		m.sayChan(cs.id, msgTimeUp(u.Name, m.channelName(target)))
+		m.sayUser(cs.id, sessions[0].Session, msgTimeUpPrivate(target))
 	default:
-		m.muteFinished(cs, sp.Key, u)
+		m.muteFinished(cs, sp.Key, sessions)
 	}
-	m.startNext(cs, now, true)
+	m.startNext(cs, now)
 }
 
-func (m *Manager) muteFinished(cs *channelState, key string, u *userEntry) {
+// muteFinished mutes a finished speaker who could not be moved out; sessions
+// are the user's sessions in the channel, newest first.
+func (m *Manager) muteFinished(cs *channelState, key string, sessions []*userEntry) {
+	u := sessions[0]
 	cs.finished[key] = u.Name
-	m.emit(SetMute{Session: u.Session, Muted: true})
-	m.sayChan(cs.id, msgMoveFailed(u.Name, m.channelName(cs.marker.TargetID)))
+	for _, s := range sessions {
+		m.emit(SetMute{Session: s.Session, Muted: true})
+	}
+	target := m.channelName(cs.marker.TargetID)
+	m.sayChan(cs.id, msgMoveFailed(u.Name, target))
+	m.sayUser(cs.id, u.Session, msgMutedPrivate(target))
 	m.dirty = true
 }
 
@@ -820,11 +1096,12 @@ func (m *Manager) Tick(now time.Time) []Action {
 		}
 		delete(m.pending, key)
 		cs := m.managed[p.from]
-		u := m.userByKey(key)
-		if cs == nil || u == nil || u.ChannelID != p.from {
+		if cs == nil {
 			continue
 		}
-		m.muteFinished(cs, key, u)
+		if sessions := m.sessionsIn(p.from, key); len(sessions) > 0 {
+			m.muteFinished(cs, key, sessions)
+		}
 	}
 
 	if m.dirty || (speaking && now.Sub(m.lastPersist) >= m.cfg.PersistInterval) {
@@ -832,7 +1109,7 @@ func (m *Manager) Tick(now time.Time) []Action {
 		m.lastPersist = now
 		m.emit(Persist{})
 	}
-	return m.flush()
+	return m.flush(now)
 }
 
 func (m *Manager) tickSpeaker(cs *channelState, now time.Time, elapsed time.Duration) {
@@ -850,52 +1127,43 @@ func (m *Manager) tickSpeaker(cs *channelState, now time.Time, elapsed time.Dura
 		m.endTurn(cs, now)
 		return
 	}
-	if next := m.nextPresent(cs); next != nil && !cs.warned && m.cfg.WarnBefore > 0 && cs.remaining <= m.cfg.WarnBefore {
-		cs.warned = true
-		cs.lastRemainAnnounce = now
-		m.sayChan(cs.id, msgWarnNext(cs.speaker.Name, next.Name, cs.remaining))
-		if u := m.presentIn(cs.id)[next.Key]; u != nil {
-			m.emit(SayUser{Session: u.Session, HTML: msgWarnNextPrivate(m.channelName(cs.id), cs.remaining)})
-		}
-		m.dirty = true
+	present := m.presentIn(cs.id)
+	if c, ok := dueReminder(m.cfg.SpeakerReminders, cs.remaining, cs.reminded); ok {
+		cs.reminded = c
+		m.sayUser(cs.id, present[cs.speaker.Key].Session, msgRemainingPrivate(cs.remaining))
 	}
+	next := m.nextPresent(cs)
+	if next == nil {
+		cs.nextKey = ""
+		return
+	}
+	if next.Key != cs.nextKey {
+		cs.nextKey, cs.nextReminded = next.Key, notReminded
+	}
+	if c, ok := dueReminder(m.cfg.NextReminders, cs.remaining, cs.nextReminded); ok {
+		cs.nextReminded = c
+		m.sayUser(cs.id, present[next.Key].Session, msgNextPrivate(m.channelName(cs.id), cs.remaining))
+	}
+}
+
+// dueReminder returns the checkpoint the remaining time has reached since the
+// last reminder: the smallest one at or above remaining and below last.
+func dueReminder(checkpoints []time.Duration, remaining, last time.Duration) (time.Duration, bool) {
+	due, ok := time.Duration(0), false
+	for _, c := range checkpoints {
+		if c >= remaining && c < last && (!ok || c < due) {
+			due, ok = c, true
+		}
+	}
+	return due, ok
 }
 
 func (m *Manager) tickAnnounce(cs *channelState, now time.Time) {
 	if cs.speaker == nil && len(cs.queue) == 0 {
 		return
 	}
-	coalesce := "status:" + strconv.FormatUint(uint64(cs.id), 10)
-	away := m.speakerAway(cs)
 	if m.cfg.QueueInterval > 0 && now.Sub(cs.lastQueueAnnounce) >= m.cfg.QueueInterval {
-		cs.lastQueueAnnounce = now
-		cs.lastRemainAnnounce = now
-		note := ""
-		switch {
-		case away:
-			note = "等待重新连接"
-		case cs.paused:
-			note = "已暂停"
-		}
-		present := m.presentIn(cs.id)
-		lines := make([]statusLine, len(cs.queue))
-		for i, q := range cs.queue {
-			lines[i] = statusLine{Name: q.Name, Offline: present[q.Key] == nil}
-		}
-		m.emit(SayChannel{
-			ChannelID: cs.id,
-			HTML:      msgStatus(cs.speaker, cs.remaining, note, lines),
-			Coalesce:  coalesce,
-		})
-		return
-	}
-	if cs.speaker != nil && !cs.paused && !away && m.cfg.RemainingInterval > 0 && now.Sub(cs.lastRemainAnnounce) >= m.cfg.RemainingInterval {
-		cs.lastRemainAnnounce = now
-		m.emit(SayChannel{
-			ChannelID: cs.id,
-			HTML:      msgRemaining(cs.speaker.Name, cs.remaining),
-			Coalesce:  coalesce,
-		})
+		cs.statusDue = true
 	}
 }
 

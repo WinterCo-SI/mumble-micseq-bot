@@ -104,12 +104,15 @@ type SetMute struct {
 	Muted   bool
 }
 
-// SayChannel sends an HTML text message to a channel. Pending messages with
-// the same non-empty Coalesce key replace each other.
+// SayChannel sends an HTML text message to a channel and a copy to its CC
+// channels. Pending messages with the same non-empty Coalesce key replace
+// each other; pending messages whose Coalesce key equals Replaces are dropped.
 type SayChannel struct {
 	ChannelID uint32
+	CC        []uint32
 	HTML      string
 	Coalesce  string
+	Replaces  string
 }
 
 // SayUser sends a private HTML text message to a user.

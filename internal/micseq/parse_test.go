@@ -73,23 +73,31 @@ func TestFormatDuration(t *testing.T) {
 }
 
 func TestParseMarker(t *testing.T) {
+	sec := time.Second
 	tests := []struct {
 		name  string
 		found bool
 		ok    bool
 		want  Marker
 	}{
-		{"会议室 [麦序/发言时间: 300秒/下麦转12]", true, true, Marker{300 * time.Second, 12}},
-		{"会议室 [麦序/发言时间: 300/下麦转5]", true, true, Marker{300 * time.Second, 5}},
-		{"会议室 [麦序/发言时间：10分钟/下麦转7]", true, true, Marker{10 * time.Minute, 7}},
-		{"会议室 [ 麦序 / 发言时间 : 50s / 下麦转 3 ]", true, true, Marker{50 * time.Second, 3}},
-		{"[麦序/发言时间:1分30/下麦转0] 大厅", true, true, Marker{90 * time.Second, 0}},
+		{"会议室 [麦序/发言时间: 300秒/下麦转12]", true, true, Marker{Duration: 300 * sec, TargetID: 12}},
+		{"会议室 [麦序/发言时间: 300/下麦转5]", true, true, Marker{Duration: 300 * sec, TargetID: 5}},
+		{"会议室 [麦序/发言时间：10分钟/下麦转7]", true, true, Marker{Duration: 10 * time.Minute, TargetID: 7}},
+		{"会议室 [ 麦序 / 发言时间 : 50s / 下麦转 3 ]", true, true, Marker{Duration: 50 * sec, TargetID: 3}},
+		{"[麦序/发言时间:1分30/下麦转0] 大厅", true, true, Marker{Duration: 90 * sec, TargetID: 0}},
+		{"会议室 [麦序/发言时间: 60s/下麦转12/CC 13,14]", true, true, Marker{Duration: 60 * sec, TargetID: 12, CC: []uint32{13, 14}}},
+		{"会议室 [麦序/发言时间: 60s/下麦转12/cc:13，14、13]", true, true, Marker{Duration: 60 * sec, TargetID: 12, CC: []uint32{13, 14}}},
+		{"会议室 [麦序/CC 5/下麦转12/发言时间: 60s]", true, true, Marker{Duration: 60 * sec, TargetID: 12, CC: []uint32{5}}},
 		{"会议室", false, true, Marker{}},
 		{"会议室 [闲聊]", false, true, Marker{}},
 		{"会议室 [麦序/发言时间: 300秒]", true, false, Marker{}},
 		{"会议室 [麦序/发言时间: 五分钟/下麦转12]", true, false, Marker{}},
 		{"会议室 [麦序/发言时间: 300秒/下麦转abc]", true, false, Marker{}},
 		{"会议室 [麦序/发言时间: 0/下麦转12]", true, false, Marker{}},
+		{"会议室 [麦序/发言时间: 60s/下麦转12/CC]", true, false, Marker{}},
+		{"会议室 [麦序/发言时间: 60s/下麦转12/CC 13,abc]", true, false, Marker{}},
+		{"会议室 [麦序/发言时间: 60s/下麦转12/下麦转13]", true, false, Marker{}},
+		{"会议室 [麦序/发言时间: 60s/下麦转12/闲聊]", true, false, Marker{}},
 	}
 	for _, tt := range tests {
 		m, found, err := ParseMarker(tt.name)
@@ -97,14 +105,14 @@ func TestParseMarker(t *testing.T) {
 			t.Errorf("ParseMarker(%q) found=%v err=%v, want found=%v ok=%v", tt.name, found, err, tt.found, tt.ok)
 			continue
 		}
-		if found && tt.ok && m != tt.want {
+		if found && tt.ok && !m.Equal(tt.want) {
 			t.Errorf("ParseMarker(%q) = %+v, want %+v", tt.name, m, tt.want)
 		}
 	}
 }
 
 func TestStripMarker(t *testing.T) {
-	if got := StripMarker("会议室 [麦序/发言时间: 300秒/下麦转12]"); got != "会议室" {
+	if got := StripMarker("会议室 [麦序/发言时间: 300秒/下麦转12/CC 13]"); got != "会议室" {
 		t.Errorf("StripMarker = %q", got)
 	}
 	if got := StripMarker("大厅"); got != "大厅" {

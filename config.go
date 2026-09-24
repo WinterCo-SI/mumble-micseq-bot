@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -42,9 +43,16 @@ type Config struct {
 
 	StateFile string `json:"state_file"`
 
-	QueueAnnounceInterval     Duration `json:"queue_announce_interval"`
-	RemainingAnnounceInterval Duration `json:"remaining_announce_interval"`
-	WarnBefore                Duration `json:"warn_before"`
+	QueueAnnounceInterval Duration `json:"queue_announce_interval"`
+	// SpeakerReminders are the remaining times at which the speaker is told
+	// privately how long is left; NextSpeakerReminders the ones at which the
+	// next user is told to get ready.
+	SpeakerReminders     Reminders `json:"speaker_reminders"`
+	NextSpeakerReminders Reminders `json:"next_speaker_reminders"`
+	// Deprecated: replaced by SpeakerReminders and NextSpeakerReminders.
+	// Still accepted so existing config files load.
+	RemainingAnnounceInterval *Duration `json:"remaining_announce_interval,omitempty"`
+	WarnBefore                *Duration `json:"warn_before,omitempty"`
 	// RejoinGrace is how long disconnected queued users keep their place,
 	// e.g. while everyone reconnects after a server restart.
 	RejoinGrace Duration `json:"rejoin_grace"`
@@ -97,22 +105,61 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 	return json.Marshal(time.Duration(d).String())
 }
 
+// Reminders is a list of durations, or "off" for none.
+type Reminders []Duration
+
+func (r *Reminders) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		switch strings.TrimSpace(strings.ToLower(s)) {
+		case "", "off", "false":
+			*r = Reminders{}
+			return nil
+		}
+		return fmt.Errorf("reminders must be a list of durations or \"off\": %s", data)
+	}
+	var list []Duration
+	if err := json.Unmarshal(data, &list); err != nil {
+		return err
+	}
+	*r = list
+	return nil
+}
+
+func (r Reminders) durations() []time.Duration {
+	out := make([]time.Duration, 0, len(r))
+	for _, d := range r {
+		if d > 0 {
+			out = append(out, time.Duration(d))
+		}
+	}
+	return out
+}
+
+func toReminders(ds []time.Duration) Reminders {
+	r := make(Reminders, len(ds))
+	for i, d := range ds {
+		r[i] = Duration(d)
+	}
+	return r
+}
+
 func defaultConfig() Config {
 	return Config{
-		Username:                  "麦序机器人",
-		CertFile:                  "micseq-bot.crt",
-		KeyFile:                   "micseq-bot.key",
-		TrustFile:                 "server.fingerprint",
-		StateFile:                 "micseq-state.json",
-		QueueAnnounceInterval:     Duration(60 * time.Second),
-		RemainingAnnounceInterval: Duration(60 * time.Second),
-		WarnBefore:                Duration(30 * time.Second),
-		RejoinGrace:               Duration(90 * time.Second),
-		SpeakerOfflineWait:        Duration(time.Minute),
-		RejoinBonus:               Duration(30 * time.Second),
-		RejoinWindow:              Duration(10 * time.Minute),
-		MessageRate:               1,
-		MessageBurst:              5,
+		Username:              "麦序机器人",
+		CertFile:              "micseq-bot.crt",
+		KeyFile:               "micseq-bot.key",
+		TrustFile:             "server.fingerprint",
+		StateFile:             "micseq-state.json",
+		QueueAnnounceInterval: Duration(60 * time.Second),
+		SpeakerReminders:      toReminders(micseq.DefaultSpeakerReminders),
+		NextSpeakerReminders:  toReminders(micseq.DefaultNextReminders),
+		RejoinGrace:           Duration(90 * time.Second),
+		SpeakerOfflineWait:    Duration(time.Minute),
+		RejoinBonus:           Duration(30 * time.Second),
+		RejoinWindow:          Duration(10 * time.Minute),
+		MessageRate:           1,
+		MessageBurst:          5,
 	}
 }
 
@@ -147,6 +194,12 @@ func (c *Config) validate() error {
 		c.MessageBurst = 1
 	}
 	c.ServerFingerprint = normalizeFingerprint(c.ServerFingerprint)
+	if c.RemainingAnnounceInterval != nil {
+		log.Print("config: remaining_announce_interval is no longer used; see speaker_reminders")
+	}
+	if c.WarnBefore != nil {
+		log.Print("config: warn_before is no longer used; see next_speaker_reminders")
+	}
 	return nil
 }
 
@@ -161,8 +214,8 @@ func (c *Config) Address() string {
 func (c *Config) managerConfig() micseq.Config {
 	mc := micseq.DefaultConfig()
 	mc.QueueInterval = time.Duration(c.QueueAnnounceInterval)
-	mc.RemainingInterval = time.Duration(c.RemainingAnnounceInterval)
-	mc.WarnBefore = time.Duration(c.WarnBefore)
+	mc.SpeakerReminders = c.SpeakerReminders.durations()
+	mc.NextReminders = c.NextSpeakerReminders.durations()
 	mc.RejoinGrace = time.Duration(c.RejoinGrace)
 	mc.SpeakerOfflineWait = time.Duration(c.SpeakerOfflineWait)
 	mc.RejoinBonus = time.Duration(c.RejoinBonus)

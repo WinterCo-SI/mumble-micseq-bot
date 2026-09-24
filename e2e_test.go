@@ -195,8 +195,7 @@ func setupE2E(t *testing.T) *e2eEnv {
 	cfg.TrustFile = filepath.Join(dir, "server.fingerprint")
 	cfg.StateFile = filepath.Join(dir, "state.json")
 	cfg.QueueAnnounceInterval = Duration(6 * time.Second)
-	cfg.RemainingAnnounceInterval = Duration(4 * time.Second)
-	cfg.WarnBefore = Duration(3 * time.Second)
+	cfg.NextSpeakerReminders = Reminders{Duration(3 * time.Second)}
 	if err := cfg.validate(); err != nil {
 		t.Fatal(err)
 	}

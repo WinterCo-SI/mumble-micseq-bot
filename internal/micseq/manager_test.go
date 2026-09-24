@@ -177,6 +177,35 @@ func countType[T Action](actions []Action) []T {
 	return out
 }
 
+// channelTexts returns the channel broadcasts; privateTexts the private
+// messages to one session.
+func channelTexts(actions []Action) []string {
+	var out []string
+	for _, a := range countType[SayChannel](actions) {
+		out = append(out, a.HTML)
+	}
+	return out
+}
+
+func privateTexts(actions []Action, session uint32) []string {
+	var out []string
+	for _, a := range countType[SayUser](actions) {
+		if a.Session == session {
+			out = append(out, a.HTML)
+		}
+	}
+	return out
+}
+
+func containsAny(texts []string, substr string) bool {
+	for _, t := range texts {
+		if strings.Contains(t, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 func hasText(actions []Action, substr string) bool {
 	for _, a := range actions {
 		switch a := a.(type) {
@@ -276,8 +305,15 @@ func TestTurnTimesOutAndMovesToTarget(t *testing.T) {
 	if len(moves) != 1 || moves[0] != (Move{Session: 1, ChannelID: chTarget}) {
 		t.Fatalf("moves = %v", moves)
 	}
-	if !hasText(acts, "已转至「休息区」") {
-		t.Fatal("missing time-up message")
+	if pm := privateTexts(acts, 1); !containsAny(pm, "你的发言时间已到，已转至「休息区」") ||
+		!containsAny(pm, "Your time is up; you have been moved to “休息区”") {
+		t.Fatalf("missing private time-up message: %v", pm)
+	}
+	if containsAny(channelTexts(acts), "已转至") {
+		t.Fatal("time-up message broadcast to the channel")
+	}
+	if pm := privateTexts(acts, 2); !containsAny(pm, "轮到你发言了") {
+		t.Fatalf("missing private turn-start message: %v", pm)
 	}
 	h.wantSpeaker("Bob")
 	h.wantQueue()
@@ -410,8 +446,10 @@ func TestDisconnectedQueuedUserKeepsPlace(t *testing.T) {
 	// Bob is skipped while offline; he keeps the head of the queue.
 	h.wantSpeaker("Carol")
 	h.wantQueue("Bob")
-	if hasText(acts, "下一位 <b>Bob</b>") {
-		t.Fatal("warned an offline user")
+	for _, pm := range countType[SayUser](acts) {
+		if strings.Contains(pm.HTML, "下一位发言者") && pm.Session != 3 {
+			t.Fatalf("next-speaker reminder to session %d, want only Carol", pm.Session)
+		}
 	}
 
 	// He reconnects (new session) within the grace period and is next.
@@ -451,7 +489,7 @@ func TestStatusShowsOfflineUsers(t *testing.T) {
 	h.sync()
 	h.leave(2)
 	acts := h.advance(60 * time.Second)
-	if !hasText(acts, "1. Bob（断线，等待重连）") {
+	if !hasText(acts, `<td>Bob</td><td><font color="#d64545">断线，等待重连</font>`) {
 		t.Fatalf("status = %s", joinText(acts))
 	}
 }
@@ -651,7 +689,7 @@ func TestUnconfirmedUnsuppressWarnsOnce(t *testing.T) {
 	h.addInitial(1, "Alice", chManaged)
 	h.sync()
 	acts := h.advance(10 * time.Second)
-	if n := strings.Count(joinText(acts), "MuteDeafen"); n != 1 {
+	if n := strings.Count(joinText(acts), "无法解除"); n != 1 {
 		t.Fatalf("MuteDeafen warnings = %d", n)
 	}
 }
@@ -720,64 +758,374 @@ func TestAdminUnsuppressExemptsQueuedUser(t *testing.T) {
 	h.wantSpeaker("Bob")
 }
 
-func TestWarnNextOnce(t *testing.T) {
+func TestNextSpeakerRemindersAreTiered(t *testing.T) {
 	h := newHarness(t)
+	h.chans[chManaged] = "会议室 [麦序/发言时间: 10分钟/下麦转20]"
 	h.addInitial(1, "Alice", chManaged)
 	h.addInitial(2, "Bob", chManaged)
 	h.sync()
 
-	acts := h.advance(29 * time.Second)
-	if hasText(acts, "请做好准备") {
-		t.Fatal("warned too early")
+	// Checkpoints: 10m (Bob becomes next with 9m59s left), 5m, 2m, 1m, 30s, 10s.
+	var got []string
+	for elapsed := time.Second; elapsed < 10*time.Minute; elapsed += time.Second {
+		acts := h.advance(time.Second)
+		for _, pm := range privateTexts(acts, 2) {
+			if !strings.Contains(pm, "你是「会议室」的下一位发言者") || !strings.Contains(pm, "You are next in “会议室”") {
+				t.Fatalf("unexpected private message: %s", pm)
+			}
+			got = append(got, FormatDuration(10*time.Minute-elapsed))
+		}
+		if containsAny(channelTexts(acts), "请做好准备") {
+			t.Fatal("next-speaker reminder broadcast to the channel")
+		}
 	}
-	acts = h.advance(time.Second)
-	if !hasText(acts, "下一位 <b>Bob</b> 请做好准备") {
-		t.Fatalf("missing channel warning: %v", acts)
-	}
-	pm := countType[SayUser](acts)
-	if len(pm) != 1 || pm[0].Session != 2 || !strings.Contains(pm[0].HTML, "你是「会议室」的下一位发言者") {
-		t.Fatalf("private warnings = %v", pm)
-	}
-	if hasText(acts, "剩余发言时间") {
-		t.Fatal("remaining-time message right after the warning")
-	}
-	acts = h.advance(29 * time.Second)
-	if hasText(acts, "请做好准备") {
-		t.Fatal("warned twice")
+	want := "9分59秒,5分钟,2分钟,1分钟,30秒,10秒"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("next-speaker reminders at %v, want %s", got, want)
 	}
 }
 
-func TestWarnWhenNextJoinsLate(t *testing.T) {
+func TestNextSpeakerWarnedWhenJoiningLate(t *testing.T) {
 	h := newHarness(t)
 	h.addInitial(1, "Alice", chManaged)
 	h.sync()
 	h.advance(40 * time.Second)
 	h.join(2, "Bob", chManaged)
 	acts := h.advance(time.Second)
-	if !hasText(acts, "下一位 <b>Bob</b> 请做好准备") {
-		t.Fatalf("missing late warning: %v", acts)
+	if pm := privateTexts(acts, 2); len(pm) != 1 || !strings.Contains(pm[0], `大约 <font color="#d64545"><b>19秒</b></font> 后轮到你`) {
+		t.Fatalf("late next-speaker reminder = %v", pm)
+	}
+	// The next checkpoint (10s) still follows.
+	acts = h.advance(9 * time.Second)
+	if pm := privateTexts(acts, 2); len(pm) != 1 || !strings.Contains(pm[0], "<b>10秒</b>") {
+		t.Fatalf("10s next-speaker reminder = %v", pm)
 	}
 }
 
-func TestPeriodicAnnouncements(t *testing.T) {
+func TestSpeakerRemindersAreTieredAndPrivate(t *testing.T) {
 	h := newHarness(t)
 	h.chans[chManaged] = "会议室 [麦序/发言时间: 10分钟/下麦转20]"
-	h.m.cfg.RemainingInterval = 30 * time.Second
+	h.addInitial(1, "Alice", chManaged)
+	h.sync()
+
+	var got []string
+	for elapsed := time.Second; elapsed < 10*time.Minute; elapsed += time.Second {
+		acts := h.advance(time.Second)
+		for _, pm := range privateTexts(acts, 1) {
+			if !strings.Contains(pm, "你的发言时间还剩") || !strings.Contains(pm, " left.") {
+				t.Fatalf("unexpected private message: %s", pm)
+			}
+			got = append(got, FormatDuration(10*time.Minute-elapsed))
+		}
+		if containsAny(channelTexts(acts), "还剩") {
+			t.Fatal("remaining time broadcast to the channel")
+		}
+	}
+	// No reminder for the full 10 minutes: the turn-start message says so.
+	want := "5分钟,3分钟,2分钟,1分钟,30秒,10秒"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("speaker reminders at %v, want %s", got, want)
+	}
+}
+
+func TestSpeakerRemindersRestartAfterRejoinBonus(t *testing.T) {
+	h := newHarness(t)
+	h.addInitial(1, "Alice", chManaged)
+	h.sync()
+	h.advance(35 * time.Second) // 30s reminder sent, 25s left
+	h.leave(1)
+	h.join(11, "Alice", chManaged) // 25s + 30s bonus = 55s
+	acts := h.advance(25 * time.Second)
+	if pm := privateTexts(acts, 11); len(pm) != 1 || !strings.Contains(pm[0], "<b>30秒</b>") {
+		t.Fatalf("reminders after the bonus = %v", pm)
+	}
+}
+
+func TestRemindersDisabled(t *testing.T) {
+	h := newHarness(t)
+	h.m.cfg.SpeakerReminders = nil
+	h.m.cfg.NextReminders = nil
+	h.addInitial(1, "Alice", chManaged)
+	h.addInitial(2, "Bob", chManaged)
+	h.sync()
+	acts := h.advance(59 * time.Second)
+	if pm := countType[SayUser](acts); len(pm) != 0 {
+		t.Fatalf("reminders sent while disabled: %v", pm)
+	}
+}
+
+func TestPeriodicStatus(t *testing.T) {
+	h := newHarness(t)
+	h.chans[chManaged] = "会议室 [麦序/发言时间: 10分钟/下麦转20]"
 	h.addInitial(1, "Alice", chManaged)
 	h.addInitial(2, "Bob", chManaged)
 	h.sync()
 
-	acts := h.advance(30 * time.Second)
-	says := countType[SayChannel](acts)
-	if len(says) != 1 || !strings.Contains(says[0].HTML, "<b>Alice</b> 剩余发言时间 9分30秒") || says[0].Coalesce == "" {
-		t.Fatalf("remaining announcement = %v", says)
+	acts := h.advance(59 * time.Second)
+	if says := countType[SayChannel](acts); len(says) != 0 {
+		t.Fatalf("channel messages before the status interval: %v", says)
 	}
-	acts = h.advance(30 * time.Second)
-	says = countType[SayChannel](acts)
-	if len(says) != 1 || !strings.Contains(says[0].HTML, "当前发言：<b>Alice</b>（剩余 9分钟）") ||
-		!strings.Contains(says[0].HTML, "1. Bob") {
+	acts = h.advance(time.Second)
+	says := countType[SayChannel](acts)
+	if len(says) != 1 || says[0].Coalesce != statusKey(chManaged) ||
+		!strings.Contains(says[0].HTML, "<td><b>Alice</b></td><td>剩余 9分钟<br>") ||
+		!strings.Contains(says[0].HTML, `<td colspan="2">Bob</td>`) {
 		t.Fatalf("status announcement = %v", says)
 	}
+
+	// A queue change resets the interval.
+	h.advance(30 * time.Second)
+	h.join(3, "Carol", chManaged)
+	if says := countType[SayChannel](h.advance(59 * time.Second)); len(says) != 0 {
+		t.Fatalf("status repeated right after a change: %v", says)
+	}
+}
+
+func TestQueueChangeIsBroadcastAndJoinerTold(t *testing.T) {
+	h := newHarness(t)
+	h.addInitial(1, "Alice", chManaged)
+	h.addInitial(2, "Bob", chManaged)
+	acts := h.sync()
+	// Nobody gets a private join note at takeover; the broadcast lists them.
+	if pm := privateTexts(acts, 2); len(pm) != 0 {
+		t.Fatalf("join note at takeover: %v", pm)
+	}
+
+	acts = h.join(3, "Carol", chManaged)
+	says := countType[SayChannel](acts)
+	if len(says) != 1 || says[0].Coalesce != statusKey(chManaged) ||
+		!strings.Contains(says[0].HTML, "排队（2 人）") || !strings.Contains(says[0].HTML, `<td colspan="2">Carol</td>`) {
+		t.Fatalf("queue broadcast = %v", says)
+	}
+	if pm := privateTexts(acts, 3); len(pm) != 1 || !strings.Contains(pm[0], "你已加入麦序队列，当前排在第 <b>2</b> 位") ||
+		!strings.Contains(pm[0], "You joined the queue as number <b>2</b>") {
+		t.Fatalf("join note = %v", pm)
+	}
+
+	// Leaving the queue is broadcast too.
+	acts = h.join(2, "Bob", chOther)
+	if says := channelTexts(acts); len(says) != 1 || strings.Contains(says[0], "Bob") || !strings.Contains(says[0], "排队（1 人）") {
+		t.Fatalf("broadcast after leaving = %v", says)
+	}
+
+	// Nothing changed: nothing is sent.
+	if acts := h.change(h.users[3], ActorNone); len(countType[SayChannel](acts)) != 0 {
+		t.Fatalf("broadcast without a change: %v", acts)
+	}
+}
+
+func TestJoiningEmptyChannelStartsTurnWithoutJoinNote(t *testing.T) {
+	h := newHarness(t)
+	h.sync()
+	acts := h.join(1, "Alice", chManaged)
+	pm := privateTexts(acts, 1)
+	if len(pm) != 1 || !strings.Contains(pm[0], "1分钟</b></font>。时间到后将转至「休息区」") {
+		t.Fatalf("private messages = %v", pm)
+	}
+}
+
+func TestEventNotesAndStatusShareOneMessage(t *testing.T) {
+	h := newHarness(t)
+	h.addInitial(1, "Alice", chManaged)
+	h.addInitial(2, "Bob", chManaged)
+	h.addInitial(3, "Carol", chManaged)
+	h.sync()
+	acts := h.join(1, "Alice", chOther)
+	says := countType[SayChannel](acts)
+	if len(says) != 1 {
+		t.Fatalf("want one broadcast, got %v", says)
+	}
+	html := says[0].HTML
+	for _, want := range []string{
+		"<b>Alice</b> 已离开频道", "<b>Alice</b> left the channel",
+		"轮到 <b>Bob</b> 发言", "<b>Bob</b>'s turn to speak: 1m.",
+		"<td><b>Bob</b></td>", `<td colspan="2">Carol</td>`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("broadcast lacks %q: %s", want, html)
+		}
+	}
+	if says[0].Coalesce != "" || says[0].Replaces != statusKey(chManaged) {
+		t.Fatalf("coalesce = %q, replaces = %q", says[0].Coalesce, says[0].Replaces)
+	}
+	if !strings.HasPrefix(html, "<table") || !strings.HasSuffix(html, "</table>") || !strings.Contains(html, "麦序 Mic Queue · 会议室") {
+		t.Fatalf("not a card: %s", html)
+	}
+}
+
+func TestCCChannelsGetBroadcasts(t *testing.T) {
+	h := newHarness(t)
+	h.chans[chManaged] = "会议室 [麦序/发言时间: 60s/下麦转20/CC 30,99,10]"
+	h.addInitial(1, "Alice", chManaged)
+	acts := h.sync()
+	says := countType[SayChannel](acts)
+	if len(says) != 1 || len(says[0].CC) != 1 || says[0].CC[0] != chOther {
+		t.Fatalf("CC = %v", says)
+	}
+	if !strings.Contains(says[0].HTML, "频道消息同时发送到「大厅」") || !strings.Contains(says[0].HTML, "CC 频道 99 不存在") {
+		t.Fatalf("takeover = %s", says[0].HTML)
+	}
+	// Private messages are not copied.
+	for _, a := range countType[SayUser](acts) {
+		if a.Session != 1 {
+			t.Fatalf("private message to %d", a.Session)
+		}
+	}
+
+	// Dropping CC takes effect immediately.
+	h.rename(chManaged, "会议室 [麦序/发言时间: 60s/下麦转20]")
+	for _, s := range countType[SayChannel](h.join(2, "Bob", chManaged)) {
+		if len(s.CC) > 0 {
+			t.Fatalf("CC after removal: %v", s)
+		}
+	}
+
+	// The stop notice still reaches the CC channels.
+	h.rename(chManaged, "会议室 [麦序/发言时间: 60s/下麦转20/CC 30]")
+	acts = h.rename(chManaged, "会议室")
+	if says := countType[SayChannel](acts); len(says) != 1 || len(says[0].CC) != 1 || !strings.Contains(says[0].HTML, "麦序模式已关闭") {
+		t.Fatalf("stop notice = %v", says)
+	}
+}
+
+// addRegistered adds a registered user who is already connected when the
+// bot syncs.
+func (h *harness) addRegistered(session, userID uint32, name string, channel uint32) {
+	h.users[session] = UserInfo{Session: session, UserID: userID, Name: name, ChannelID: channel, Suppressed: channel == chManaged}
+}
+
+// connectAgain simulates a registered user connecting a second time straight
+// into a channel while the old session is still there.
+func (h *harness) connectAgain(session, userID uint32, name string, channel uint32) []Action {
+	return h.change(UserInfo{Session: session, UserID: userID, Name: name, ChannelID: channel, Suppressed: channel == chManaged}, ActorNone)
+}
+
+func TestSpeakerGhostSessionDoesNotEndTurn(t *testing.T) {
+	h := newHarness(t)
+	h.addRegistered(1, 5, "Alice", chManaged)
+	h.addRegistered(2, 6, "Bob", chManaged)
+	h.sync()
+	h.advance(10 * time.Second)
+
+	// Alice reconnects; the server has not dropped the old session yet.
+	acts := h.connectAgain(11, 5, "Alice", chManaged)
+	h.wantSpeaker("Alice")
+	h.wantQueue("Bob")
+	if u := countType[Unsuppress](acts); len(u) != 1 || u[0].Session != 11 {
+		t.Fatalf("unsuppress = %v", u)
+	}
+	if len(countType[SayChannel](acts)) != 0 || len(countType[SayUser](acts)) != 0 {
+		t.Fatalf("a second session was announced: %s", joinText(acts))
+	}
+
+	// The ghost goes away: nothing happens, no offline wait, no bonus.
+	acts = h.leave(1)
+	if hasText(acts, "已离线") || hasText(acts, "重新连接") {
+		t.Fatalf("ghost removal treated as a disconnect: %s", joinText(acts))
+	}
+	if h.remaining() != 50*time.Second {
+		t.Fatalf("remaining = %v", h.remaining())
+	}
+
+	// Reminders go to the live session; the turn ends on time.
+	acts = h.advance(20 * time.Second)
+	if pm := privateTexts(acts, 11); len(pm) != 1 {
+		t.Fatalf("reminders to the new session = %v", pm)
+	}
+	acts = h.advance(30 * time.Second)
+	if m := countType[Move](acts); len(m) != 1 || m[0].Session != 11 {
+		t.Fatalf("moves = %v", m)
+	}
+	h.wantSpeaker("Bob")
+}
+
+func TestDuplicateSessionsAllMovedAtEndOfTurn(t *testing.T) {
+	h := newHarness(t)
+	h.addRegistered(1, 5, "Alice", chManaged)
+	h.addRegistered(2, 6, "Bob", chManaged)
+	h.sync()
+	h.connectAgain(11, 5, "Alice", chManaged)
+	if h.users[1].Suppressed || h.users[11].Suppressed {
+		t.Fatal("both of the speaker's sessions should be able to talk")
+	}
+
+	acts := h.advance(60 * time.Second)
+	var moved []uint32
+	for _, m := range countType[Move](acts) {
+		moved = append(moved, m.Session)
+	}
+	if len(moved) != 2 || h.users[1].ChannelID != chTarget || h.users[11].ChannelID != chTarget {
+		t.Fatalf("moved = %v", moved)
+	}
+	if pm := countType[SayUser](acts); len(pm) == 0 || privateTexts(acts, 1) != nil {
+		t.Fatalf("private messages should go to the newest session only: %v", pm)
+	}
+	h.wantSpeaker("Bob")
+	if len(countType[SetMute](h.advance(10*time.Second))) != 0 {
+		t.Fatal("muted after a confirmed move")
+	}
+}
+
+func TestDuplicateSessionsMutedWhenMoveFails(t *testing.T) {
+	h := newHarness(t)
+	h.noMoves = true
+	h.addRegistered(1, 5, "Alice", chManaged)
+	h.addRegistered(2, 6, "Bob", chManaged)
+	h.sync()
+	h.connectAgain(11, 5, "Alice", chManaged)
+	h.advance(60 * time.Second)
+	acts := h.advance(5 * time.Second)
+	if m := countType[SetMute](acts); len(m) != 2 {
+		t.Fatalf("mutes = %v", m)
+	}
+	// Leaving with both sessions lifts both mutes.
+	h.join(1, "Alice", chOther)
+	acts = h.join(11, "Alice", chOther)
+	if m := countType[SetMute](acts); len(m) != 2 {
+		t.Fatalf("unmutes = %v", m)
+	}
+}
+
+func TestQueuedUserWithTwoSessionsQueuesOnce(t *testing.T) {
+	h := newHarness(t)
+	h.addRegistered(1, 5, "Alice", chManaged)
+	h.addRegistered(2, 6, "Bob", chManaged)
+	h.addRegistered(3, 7, "Carol", chManaged)
+	h.sync()
+
+	acts := h.connectAgain(12, 6, "Bob", chManaged)
+	h.wantQueue("Bob", "Carol")
+	if len(countType[SayChannel](acts)) != 0 || len(countType[SayUser](acts)) != 0 {
+		t.Fatalf("second session announced: %s", joinText(acts))
+	}
+	h.leave(2)
+	h.wantQueue("Bob", "Carol")
+	acts = h.advance(60 * time.Second)
+	h.wantSpeaker("Bob")
+	if u := countType[Unsuppress](acts); len(u) != 1 || u[0].Session != 12 {
+		t.Fatalf("unsuppress = %v", u)
+	}
+	if hasText(acts, "断线") {
+		t.Fatalf("Bob shown offline: %s", joinText(acts))
+	}
+}
+
+func TestSpeakerSecondSessionLeavingKeepsTurn(t *testing.T) {
+	h := newHarness(t)
+	h.addRegistered(1, 5, "Alice", chManaged)
+	h.addRegistered(2, 6, "Bob", chManaged)
+	h.sync()
+	h.connectAgain(11, 5, "Alice", chManaged)
+	acts := h.join(11, "Alice", chOther)
+	h.wantSpeaker("Alice")
+	if hasText(acts, "已离开频道") {
+		t.Fatalf("turn ended while a session is still there: %s", joinText(acts))
+	}
+	acts = h.join(1, "Alice", chOther)
+	if !hasText(acts, "<b>Alice</b> 已离开频道") {
+		t.Fatalf("turn did not end when the last session left: %s", joinText(acts))
+	}
+	h.wantSpeaker("Bob")
 }
 
 func TestIdleChannelIsQuiet(t *testing.T) {

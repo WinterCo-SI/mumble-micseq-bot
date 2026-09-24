@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -34,9 +35,9 @@ func TestSenderRender(t *testing.T) {
 
 func TestSenderCoalesce(t *testing.T) {
 	s := NewSender(1, 5)
-	s.ToChannel(1, "a", "status:1")
-	s.ToChannel(1, "b", "")
-	s.ToChannel(1, "c", "status:1")
+	s.ToChannels([]uint32{1}, "a", "status:1", "")
+	s.ToChannels([]uint32{1}, "b", "", "")
+	s.ToChannels([]uint32{1}, "c", "status:1", "")
 	if m := s.pop(); m.html != "c" {
 		t.Errorf("first = %q, want replaced status", m.html)
 	}
@@ -45,6 +46,38 @@ func TestSenderCoalesce(t *testing.T) {
 	}
 	if s.pending() {
 		t.Error("queue not empty")
+	}
+}
+
+func TestSenderReplacesStaleStatus(t *testing.T) {
+	s := NewSender(1, 5)
+	s.ToChannels([]uint32{1}, "old status", "status:1", "")
+	s.ToChannels([]uint32{2}, "other channel", "status:2", "")
+	s.ToChannels([]uint32{1}, "event with status", "", "status:1")
+	for _, want := range []string{"other channel", "event with status"} {
+		if m := s.pop(); m == nil || m.html != want {
+			t.Fatalf("popped %v, want %q", m, want)
+		}
+	}
+	if s.pending() {
+		t.Error("stale status still queued")
+	}
+}
+
+func TestSenderRenderTable(t *testing.T) {
+	s := NewSender(1, 5)
+	table := `<table><tr><th colspan="3">麦序 · Room</th></tr><tr><td>1</td><td>A&amp;B</td><td>断线<br><font>offline</font></td></tr><tr><td>2</td><td colspan="2">Carol</td></tr></table>`
+	s.allowHTML.Store(false)
+	if got, want := s.render(table), "麦序 · Room\n1 A&B 断线\noffline\n2 Carol"; got != want {
+		t.Errorf("plain table = %q, want %q", got, want)
+	}
+
+	s.allowHTML.Store(true)
+	s.maxLen.Store(int64(len([]rune(table)) - 1))
+	got := s.render(table)
+	if len([]rune(got)) >= len([]rune(table)) || !strings.HasSuffix(got, "……</td></tr></table>") ||
+		!strings.Contains(got, "A&amp;B") || strings.Contains(got, "Carol") {
+		t.Errorf("truncated table = %q", got)
 	}
 }
 
@@ -171,12 +204,40 @@ func TestConfigDuration(t *testing.T) {
 	}
 }
 
+func TestConfigReminders(t *testing.T) {
+	cfg := defaultConfig()
+	if err := json.Unmarshal([]byte(`{"speaker_reminders": ["5分钟", 60, "30s"], "next_speaker_reminders": "off"}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	mc := cfg.managerConfig()
+	if len(mc.SpeakerReminders) != 3 || mc.SpeakerReminders[1] != time.Minute || len(mc.NextReminders) != 0 {
+		t.Errorf("reminders = %v / %v", mc.SpeakerReminders, mc.NextReminders)
+	}
+	if err := json.Unmarshal([]byte(`{"speaker_reminders": "soon"}`), &cfg); err == nil {
+		t.Error("want error for invalid reminders")
+	}
+	if def := defaultConfig(); len(def.managerConfig().NextReminders) == 0 {
+		t.Error("no default next-speaker reminders")
+	}
+}
+
+func TestDeprecatedConfigStillLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := `{"server": "localhost", "remaining_announce_interval": "60s", "warn_before": "30s"}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err != nil {
+		t.Fatalf("old config rejected: %v", err)
+	}
+}
+
 func TestExampleConfigLoads(t *testing.T) {
 	cfg, err := loadConfig("config.example.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Address() != "mumble.example.com:64738" || time.Duration(cfg.WarnBefore) != 30*time.Second {
+	if cfg.Address() != "mumble.example.com:64738" || len(cfg.NextSpeakerReminders) == 0 {
 		t.Errorf("unexpected config: %+v", cfg)
 	}
 }

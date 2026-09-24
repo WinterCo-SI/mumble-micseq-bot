@@ -87,3 +87,24 @@ func FormatDuration(d time.Duration) string {
 	}
 	return b.String()
 }
+
+// FormatDurationEN renders a duration in English, e.g. "4m 30s". Durations
+// are rounded up to whole seconds.
+func FormatDurationEN(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	secs := int64((d + time.Second - 1) / time.Second)
+	h, m, s := secs/3600, secs/60%60, secs%60
+	var parts []string
+	if h > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", h))
+	}
+	if m > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", m))
+	}
+	if s > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", s))
+	}
+	return strings.Join(parts, " ")
+}

@@ -15,8 +15,8 @@
   "state_file": "micseq-state.json",
 
   "queue_announce_interval": "60s",
-  "remaining_announce_interval": "60s",
-  "warn_before": "30s",
+  "speaker_reminders": ["1小时", "30分钟", "15分钟", "10分钟", "5分钟", "3分钟", "2分钟", "1分钟", "30秒", "10秒"],
+  "next_speaker_reminders": ["10分钟", "5分钟", "2分钟", "1分钟", "30秒", "10秒"],
   "rejoin_grace": "90s",
   "speaker_offline_wait": "1分钟",
   "rejoin_bonus": "30s",

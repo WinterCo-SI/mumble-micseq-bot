@@ -353,7 +353,13 @@ func (b *Bot) execute(c *gumble.Client, actions []micseq.Action) error {
 	for _, a := range actions {
 		switch a := a.(type) {
 		case micseq.SayChannel:
-			b.sender.ToChannel(a.ChannelID, a.HTML, a.Coalesce)
+			b.sender.ToChannels([]uint32{a.ChannelID}, a.HTML, a.Coalesce, a.Replaces)
+			if len(a.CC) > 0 {
+				// The server drops a message outright if the bot may not write
+				// to any one of its channels, so a CC channel that denies
+				// TextMessage must not take the managed channel's copy with it.
+				b.sender.ToChannels(a.CC, a.HTML, ccKey(a.Coalesce), ccKey(a.Replaces))
+			}
 		case micseq.SayUser:
 			b.sender.ToUser(c, a.Session, a.HTML)
 		case micseq.Persist:
@@ -394,6 +400,13 @@ func (b *Bot) execute(c *gumble.Client, actions []micseq.Action) error {
 		return errUnresponsive
 	}
 	return nil
+}
+
+func ccKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	return key + "/cc"
 }
 
 func describeDenied(e *gumble.PermissionDeniedEvent) string {
