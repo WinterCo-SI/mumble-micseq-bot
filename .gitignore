@@ -1,0 +1,8 @@
+/micseq-bot.exe
+/micseq-bot
+/dist/
+/config.json
+/*.crt
+/*.key
+/server.fingerprint
+/micseq-state.json

@@ -1,0 +1,30 @@
+{
+  "server": "mumble.example.com:64738",
+  "username": "麦序机器人",
+  "password": "",
+  "tokens": [],
+
+  "cert_file": "micseq-bot.crt",
+  "key_file": "micseq-bot.key",
+  "register": true,
+
+  "server_fingerprint": "",
+  "trust_file": "server.fingerprint",
+
+  "home_channel": 0,
+  "state_file": "micseq-state.json",
+
+  "queue_announce_interval": "60s",
+  "remaining_announce_interval": "60s",
+  "warn_before": "30s",
+  "rejoin_grace": "90s",
+  "speaker_offline_wait": "1分钟",
+  "rejoin_bonus": "30s",
+  "rejoin_window": "10分钟",
+
+  "message_rate": 1,
+  "message_burst": 5,
+
+  "ignore_users": [],
+  "pinyin_sort": true
+}
